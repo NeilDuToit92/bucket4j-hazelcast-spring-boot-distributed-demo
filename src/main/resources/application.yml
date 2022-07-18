@@ -1,0 +1,14 @@
+buckets:
+  config:
+    - name: A
+      capacity: 10
+      refillMinutes: 1
+      refillSeconds: 0
+    - name: B
+      capacity: 5
+      refillMinutes: 0
+      refillSeconds: 15
+    - name: C
+      capacity: 1
+      refillMinutes: 1
+      refillSeconds: 3
