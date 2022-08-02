@@ -1,8 +1,11 @@
 package za.co.neildutoit.bucket.ratelimit;
 
-import io.github.bucket4j.*;
-import io.github.bucket4j.grid.ProxyManager;
-import io.github.bucket4j.grid.jcache.JCache;
+import com.hazelcast.core.HazelcastInstance;
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.Bucket;
+import io.github.bucket4j.BucketConfiguration;
+import io.github.bucket4j.ConsumptionProbe;
+import io.github.bucket4j.grid.hazelcast.HazelcastProxyManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
@@ -12,12 +15,11 @@ import org.aspectj.lang.reflect.MethodSignature;
 import org.springframework.stereotype.Component;
 import za.co.neildutoit.bucket.config.BucketConfig;
 import za.co.neildutoit.bucket.config.BucketProperties;
+import za.co.neildutoit.bucket.exception.RateLimitExceededException;
 
 import javax.annotation.PostConstruct;
-import javax.cache.Cache;
 import java.lang.reflect.Method;
 import java.time.Duration;
-import java.util.function.Supplier;
 
 @Aspect
 @Component
@@ -25,33 +27,25 @@ import java.util.function.Supplier;
 @RequiredArgsConstructor
 public class BucketRateLimitService {
 
-  private final Cache cache;
-
+  private final HazelcastInstance hzInstance;
   private final BucketProperties bucketProperties;
-
-  private ProxyManager<String> buckets;
+  private HazelcastProxyManager<String> proxyManager;
 
   @PostConstruct
   public void init() {
-    buckets = Bucket4j.extension(JCache.class).proxyManagerForCache(this.cache);
+    this.proxyManager = new HazelcastProxyManager<>(hzInstance.getMap("bucket-map"));
   }
 
   @Around("@annotation(za.co.neildutoit.bucket.ratelimit.BucketRateLimit)")
   public Object applyRateLimit(ProceedingJoinPoint point) throws Throwable {
-    BucketRateLimit myAnnotation = getAnnotation(point);
+    BucketRateLimit rateLimit = getAnnotation(point);
 
-    BucketConfig selectedBucket = getCorrectBucket(point, myAnnotation);
+    BucketConfig selectedBucket = getCorrectBucket(rateLimit);
     BucketConfiguration bucketConfiguration = getBucketConfiguration(selectedBucket);
 
-    // Prepare configuration supplier which will be called(on first interaction with proxy) if bucket was not saved yet previously.
-    Supplier<BucketConfiguration> configurationLazySupplier = () -> bucketConfiguration;
+    Bucket requestBucket = this.proxyManager.builder().build(selectedBucket.getName(), bucketConfiguration);
 
-    // Acquire proxy to bucket in the cache
-    Bucket bucket = buckets.getProxy(selectedBucket.getName(), configurationLazySupplier);
-
-    // Attempt to consume the number of tokens specified in the annotation (1 by default)
-    log.debug("Attempting to consume {} tokens from bucket {}, available tokens: {}", myAnnotation.consumeAmount(), selectedBucket.getName(), bucket.getAvailableTokens());
-    ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(myAnnotation.consumeAmount());
+    ConsumptionProbe probe = requestBucket.tryConsumeAndReturnRemaining(rateLimit.consumeAmount());
 
     Object object;
     if (probe.isConsumed()) {
@@ -61,7 +55,7 @@ public class BucketRateLimitService {
     } else {
       // limit is exceeded
       log.warn("Consume failure - Refill in {}", probe.getNanosToWaitForRefill());
-      throw new Exception("Limit exceeded");
+      throw new RateLimitExceededException("Limit exceeded");
     }
 
     return object;
@@ -87,18 +81,17 @@ public class BucketRateLimitService {
     //Calculate everything in seconds
     long seconds = selectedBucket.getRefillSeconds() + (selectedBucket.getRefillMinutes() * 60);
 
-    return Bucket4j.configurationBuilder()
+    return BucketConfiguration.builder()
             .addLimit(Bandwidth.simple(selectedBucket.getCapacity(), Duration.ofSeconds(seconds)))
-            .buildConfiguration();
+            .build();
   }
 
   /**
    * Uses the bucket configured in the annotation to get the configuration for the bucket
    *
-   * @param point - The Aspect interrupt point
    * @return BucketConfig if found, throws RuntimeException if not found
    */
-  private BucketConfig getCorrectBucket(ProceedingJoinPoint point, BucketRateLimit myAnnotation) {
+  private BucketConfig getCorrectBucket(BucketRateLimit myAnnotation) {
     String bucketToUse = myAnnotation.bucket();
 
     BucketConfig selectedBucket = null;
@@ -121,7 +114,6 @@ public class BucketRateLimitService {
   private BucketRateLimit getAnnotation(ProceedingJoinPoint point) {
     MethodSignature signature = (MethodSignature) point.getSignature();
     Method method = signature.getMethod();
-    BucketRateLimit myAnnotation = method.getAnnotation(BucketRateLimit.class);
-    return myAnnotation;
+    return method.getAnnotation(BucketRateLimit.class);
   }
 }
